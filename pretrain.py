@@ -339,3 +339,4 @@ for epoch in range(NUM_EPOCHS):
 
 torch.save(model.state_dict(), 'lstm_eth_trading_multi.pth')
 print("Model saved")
+
