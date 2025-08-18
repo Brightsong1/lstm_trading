@@ -9,24 +9,25 @@ from torch.amp import autocast, GradScaler
 import gc
 import os
 import time
+import joblib
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-import joblib  
 
 MAX_SEQUENCE_LENGTH = 129600
 MIN_SEQUENCE_LENGTH = 1
-HIDDEN_SIZE = 80
+HIDDEN_SIZE = 32
 NUM_LAYERS = 1
-BINARY_OUTPUT_SIZE = 1  
-REG_OUTPUT_SIZE = 2  
-BATCH_SIZE = 32
-NUM_EPOCHS = 40
+BINARY_OUTPUT_SIZE = 1
+REG_OUTPUT_SIZE = 2
+BATCH_SIZE = 8
+NUM_EPOCHS = 10
 LEARNING_RATE = 0.0005
 WEIGHT_DECAY = 1e-5
-WARMUP_EPOCHS = 5
-ACCUMULATION_STEPS = 4
+WARMUP_EPOCHS = 3
+ACCUMULATION_STEPS = 2
 CLASS_WEIGHT = 1.0
 REG_WEIGHT = 1.0
 GRAD_MAX_NORM = 0.5
+DROPOUT = 0.1
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -57,7 +58,7 @@ def get_label_and_targets(row, historical_data):
     if row['entry_price'] == -1:
         return 2, np.nan, np.nan
     elif row['side'] == 'Buy':
-        label = 0
+        label = 0  # Long
         mask = (historical_data['timestamp'] <= row['start_time'])
         atr = historical_data[mask]['ATR_14h'].iloc[-1] if 'ATR_14h' in historical_data else 0.0
         if atr == 0.0:
@@ -66,7 +67,7 @@ def get_label_and_targets(row, historical_data):
         take_profit = np.clip((row['entry_price'] + 3 * atr) / row['entry_price'] * 100, a_min=-100, a_max=100)
         return label, stop_loss, take_profit
     elif row['side'] == 'Sell':
-        label = 1
+        label = 1  # Short
         mask = (historical_data['timestamp'] <= row['start_time'])
         atr = historical_data[mask]['ATR_14h'].iloc[-1] if 'ATR_14h' in historical_data else 0.0
         if atr == 0.0:
@@ -140,7 +141,9 @@ print("Checking indicators for infinite values:", np.isinf(historical_data[['SMA
 features = ['open_pct', 'high_pct', 'low_pct', 'close_pct', 'volume_pct', 'SMA_10h_pct', 'EMA_10h_pct', 'RSI_14h', 'MACD_pct', 'MACD_Signal_pct', 'BB_Upper_pct', 'BB_Lower_pct', 'ATR_14h_pct']
 scaler = MinMaxScaler()
 historical_data[features] = scaler.fit_transform(historical_data[features])
-joblib.dump(scaler, 'features_scaler.pkl')  
+
+joblib.dump(scaler, 'features_scaler.pkl')
+print("Feature scaler saved to 'features_scaler.pkl'")
 
 print("Checking data after normalization for NaN:", historical_data[features].isna().sum())
 print("Checking data after normalization for infinite values:", np.isinf(historical_data[features]).sum())
@@ -154,7 +157,9 @@ median_sl = trade_data.loc[valid_trades, 'stop_loss'].median()
 median_tp = trade_data.loc[valid_trades, 'take_profit'].median()
 trade_data.loc[~valid_trades, 'stop_loss'] = median_sl
 trade_data.loc[~valid_trades, 'take_profit'] = median_tp
-joblib.dump(sl_tp_scaler, 'sl_tp_scaler.pkl')  
+
+joblib.dump(sl_tp_scaler, 'sl_tp_scaler.pkl')
+print("SL/TP scaler saved to 'sl_tp_scaler.pkl'")
 
 print(f"NaN in stop_loss/take_profit after normalization: {trade_data[['stop_loss', 'take_profit']].isna().sum()}")
 
@@ -184,9 +189,9 @@ print(f"Sequences: {len(X)}, Skipped trades: {len(skipped_trades)}")
 print(f"Class distribution: \n{pd.Series(y).value_counts()}")
 print(f"Checking stop_loss/take_profit for NaN: {np.isnan(stop_losses).sum()}, {np.isnan(take_profits).sum()}")
 
-y_long = np.where(y == 0, 1, 0)
-y_short = np.where(y == 1, 1, 0)
-y_hold = np.where(y == 2, 1, 0)
+y_long = np.where(y == 0, 1, 0)  # Buy=1, else=0
+y_short = np.where(y == 1, 1, 0)  # Sell=1, else=0
+y_hold = np.where(y == 2, 1, 0)  # Hold=1, else=0
 
 reg_mask = y != 2
 X_reg = [X[i] for i in range(len(X)) if reg_mask[i]]
@@ -197,14 +202,14 @@ take_profits_reg = take_profits[reg_mask]
 class TradingDataset(Dataset):
     def __init__(self, X, y, lengths, max_len, sl=None, tp=None):
         self.X = [torch.tensor(x, dtype=torch.float32).contiguous() for x in X]
-        self.y = torch.tensor(y, dtype=torch.float32).contiguous() if sl is None else None  
+        self.y = torch.tensor(y, dtype=torch.float32).contiguous() if sl is None else None
         self.sl = torch.tensor(sl, dtype=torch.float32).contiguous() if sl is not None else None
         self.tp = torch.tensor(tp, dtype=torch.float32).contiguous() if tp is not None else None
         self.lengths = lengths
         self.max_len = max_len
 
     def __len__(self):
-        return len(self.X) 
+        return len(self.X)
 
     def __getitem__(self, idx):
         seq = self.X[idx]
@@ -216,23 +221,39 @@ class TradingDataset(Dataset):
         else:
             return padded, self.sl[idx], self.tp[idx], seq_len
 
+class Attention(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.attn = nn.Linear(hidden_size, 1)
+
+    def forward(self, out):
+        attn_weights = torch.softmax(self.attn(out), dim=1)
+        return torch.sum(out * attn_weights, dim=1)
+
 class BinaryLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, output_size):
         super(BinaryLSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.0)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=DROPOUT, bidirectional=False)
+        self.transformer_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=hidden_size, nhead=4, dropout=DROPOUT), num_layers=1)
+        self.attention = Attention(hidden_size)
         self.fc = nn.Linear(hidden_size, output_size)
 
     def forward(self, x, lengths):
         packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
         out, _ = self.lstm(packed)
         out, _ = pad_packed_sequence(out, batch_first=True)
-        out = out[:, -1, :]
+        out = out.transpose(0, 1)  # For transformer: (seq_len, batch, hidden)
+        out = self.transformer_encoder(out)
+        out = out.transpose(0, 1)  # Back to (batch, seq_len, hidden)
+        out = self.attention(out)
         return self.fc(out)
 
 class RegressionLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers):
         super(RegressionLSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.0)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=DROPOUT, bidirectional=False)
+        self.transformer_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=hidden_size, nhead=4, dropout=DROPOUT), num_layers=1)
+        self.attention = Attention(hidden_size)
         self.fc_sl = nn.Linear(hidden_size, 1)
         self.fc_tp = nn.Linear(hidden_size, 1)
 
@@ -240,7 +261,10 @@ class RegressionLSTMModel(nn.Module):
         packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
         out, _ = self.lstm(packed)
         out, _ = pad_packed_sequence(out, batch_first=True)
-        out = out[:, -1, :]
+        out = out.transpose(0, 1)
+        out = self.transformer_encoder(out)
+        out = out.transpose(0, 1)
+        out = self.attention(out)
         sl_out = torch.clamp(self.fc_sl(out), min=-10.0, max=10.0)
         tp_out = torch.clamp(self.fc_tp(out), min=-10.0, max=10.0)
         return sl_out, tp_out
@@ -308,12 +332,11 @@ for opt in optimizers.values():
 dataset_long = TradingDataset(X, y_long, lengths, MAX_SEQUENCE_LENGTH)
 dataset_short = TradingDataset(X, y_short, lengths, MAX_SEQUENCE_LENGTH)
 dataset_hold = TradingDataset(X, y_hold, lengths, MAX_SEQUENCE_LENGTH)
+dataset_reg = TradingDataset(X_reg, None, lengths_reg, MAX_SEQUENCE_LENGTH, sl=stop_losses_reg, tp=take_profits_reg)
 
 loader_long = DataLoader(dataset_long, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True, num_workers=2)
 loader_short = DataLoader(dataset_short, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True, num_workers=2)
 loader_hold = DataLoader(dataset_hold, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True, num_workers=2)
-
-dataset_reg = TradingDataset(X_reg, None, lengths_reg, MAX_SEQUENCE_LENGTH, sl=stop_losses_reg, tp=take_profits_reg)
 loader_reg = DataLoader(dataset_reg, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True, num_workers=2)
 
 loaders = {
